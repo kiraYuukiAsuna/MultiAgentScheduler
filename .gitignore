@@ -1,0 +1,11 @@
+__pycache__
+.claude/
+.venv/
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.toc
+*.xdv
+*.png

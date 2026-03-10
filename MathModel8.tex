@@ -1,0 +1,1071 @@
+\documentclass[11pt,a4paper]{article}
+
+% 中文支持
+\usepackage[UTF8]{ctex}
+\usepackage[utf8]{inputenc}
+
+% 数学宏包
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{float}
+\usepackage{listings}
+
+% 页面设置
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+
+% 定理环境
+\newtheorem{definition}{定义}[section]
+\newtheorem{remark}{注}[section]
+
+\title{\textbf{多针细胞染料灌注调度问题的数学模型} \\ \large v8.0: 最小距离退让与实时连续碰撞检测 \\ (NSGA-II完整建模文档)}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{问题描述}
+%==============================================================================
+
+\subsection{系统概述}
+
+在脑组织切片样本上，使用明场显微镜（40x镜头）根据预设地图区域扫描后检测到$N$个神经元细胞。通过图着色算法将所有细胞划分为$M$种不同颜色，确保相邻细胞颜色不同，以便灌注后获得颜色差异最大的神经元图像，提高神经元重建分支的准确性。
+
+系统配备$M$根注射针，各针以特定角度$(\theta_m^{XY}, \theta_m^{Z})$固定于显微镜镜头周围。\textbf{每根针恰好对应一种颜色}，颜色与针的分配关系预先确定。所有针均可到达规划地图的任意位置。
+
+\subsection{状态机模型}
+
+单针处理单个细胞的过程由有限状态机驱动，状态划分为两个主要阶段：
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|l|p{6cm}|}
+\hline
+\textbf{阶段} & \textbf{耗时} & \textbf{资源占用} & \textbf{特性描述} \\
+\hline
+Find阶段 & $t^{\text{find}} \approx 1$分钟 & 独占相机 & 包含：移动到细胞、自动校准、定位细胞、下针、轴向注射等步骤；该阶段\textbf{不可中断} \\
+\hline
+Wait阶段 & $t^{\text{wait}} \approx 4$分钟 & 占用物理空间 & 等待染料扩散；该阶段\textbf{可被中断}，针保持在细胞位置，但释放相机资源 \\
+\hline
+\end{tabular}
+\caption{细胞处理的两阶段状态模型}
+\end{table}
+
+\subsection{核心约束}
+\begin{enumerate}
+    \item \textbf{颜色-针绑定}：每根针恰好处理一种颜色的所有细胞，一一对应关系
+    \item \textbf{相机互斥}：任意时刻最多一根针处于Find阶段（独占相机资源）
+    \item \textbf{碰撞避免}：考虑针身长度的三维空间\textbf{实时连续}碰撞检测，多针不能同时占据会发生几何干涉的位置（包括退让后的非细胞位置）
+    \item \textbf{并行机制}：一针进入Wait阶段后释放相机，其他空闲针可获取相机进入Find阶段
+\end{enumerate}
+
+\subsection{优化目标}
+\begin{enumerate}
+    \item 最小化总完成时间（makespan）$C_{\max}$
+    \item 最小化总移动距离 $D_{\text{total}}$
+    \item 最小化退让操作次数 $N_{\text{retract}}$
+    \item 最小化总阻塞等待时间 $T_{\text{blocked}}$
+\end{enumerate}
+
+%==============================================================================
+\section{模型架构与核心假设}
+%==============================================================================
+
+本模型采用\textbf{基于离散事件仿真的动态调度}方法，与传统的静态MILP建模不同。
+
+\subsection{资源分类与解耦}
+
+系统中存在两类关键资源：
+
+\begin{definition}[全局资源]
+\textbf{相机}是唯一的全局资源，仅在Find阶段被占用。任意时刻最多一根针可以占用相机。
+\end{definition}
+
+\begin{definition}[空间资源——连续空间]
+\textbf{物理空间}是连续分布式资源。每根针在任意时刻均占据其\textbf{实际针尖所在三维坐标}对应的空间资源——无论该位置是细胞位置、退让中间位置，还是移动途中的任意位置。
+\end{definition}
+
+\subsection{分层避障策略}
+
+碰撞避免分为两个层次：
+
+\begin{enumerate}
+    \item \textbf{调度层（本模型负责）}：
+    \begin{itemize}
+        \item 决策"谁先去哪里"以及"是否需要退让、退让多远"
+        \item 保证\textbf{目标位置的静态安全性}：在针开始移动前，确保其\textbf{目的地}不与任何其他针\textbf{当前实际位置}发生几何冲突
+        \item 碰撞判定基于\textbf{实时几何计算}，以连续三维坐标为输入
+    \end{itemize}
+    
+    \item \textbf{路径规划层（底层黑盒，本模型假设存在）}：
+    \begin{itemize}
+        \item 若起点和终点均安全，则能规划出一条无碰撞的移动路径
+        \item 具体路径规划算法不在本模型范围内
+    \end{itemize}
+\end{enumerate}
+
+\subsection{最小距离轴向退让机制} \label{sec:retract}
+
+\begin{definition}[退让轴]
+每根针$m$具有固有的\textbf{退让方向} $\mathbf{d}_m^{\text{ret}}$，默认取为针的安装方向（从针尖指向针座），即沿针身向上抽离样本的方向：
+\begin{equation}
+    \mathbf{d}_m^{\text{ret}} = \mathbf{d}_m
+\end{equation}
+退让时，针沿此方向做\textbf{最小距离}后移，仅退让到刚好消除当前冲突的位置。
+\end{definition}
+
+\begin{definition}[退让后的针尖位置]
+针$m$原本针尖位于位置$\mathbf{p}$，沿退让轴退让距离$\delta \geq 0$后，其针尖新位置为：
+\begin{equation}
+    \mathbf{p}_m^{\text{ret}}(\mathbf{p}, \delta) = \mathbf{p} + \delta \cdot \mathbf{d}_m^{\text{ret}}
+\end{equation}
+当$\delta = 0$时为原位不动。退让位置不局限于任何预设固定点，而是沿退让轴的\textbf{连续}位置。
+\end{definition}
+
+\begin{definition}[最小安全退让距离] \label{def:min_retract}
+给定系统当前状态（所有其他针的实际位置），针$m$在位置$\mathbf{p}$处为消除所有几何冲突所需的最小退让距离定义为：
+\begin{equation}
+    \delta_m^*(\mathbf{p}, \tau) = \inf \left\{ \delta \geq 0 \;\middle|\; \forall q \in \mathcal{M} \setminus \{m\}: \; \textsc{Conflict}\big(m, \mathbf{p}_m^{\text{ret}}(\mathbf{p}, \delta), \; q, \textsc{ActualPos}_q(\tau)\big) = 0 \right\}
+\end{equation}
+其中$\textsc{ActualPos}_q(\tau)$是针$q$在时刻$\tau$的实际针尖三维坐标，$\textsc{Conflict}(\cdot)$是实时几何冲突判定函数（见第\ref{sec:collision}节）。
+\end{definition}
+
+\begin{remark}[退让距离上界]
+定义退让距离上界 $\delta_{\max}$，取为针从最深工作位置沿退让轴完全抽出工作区域所需的距离。当$\delta \geq \delta_{\max}$时，针完全脱离工作空间，必然不与任何其他针冲突。因此$\delta_m^* \leq \delta_{\max}$始终成立。
+\end{remark}
+
+\begin{remark}[与v7.3固定退让点方案的核心差异]
+\begin{itemize}
+    \item \textbf{v7.3}：退让$\equiv$回到预设安全点$r_m$，距离固定且通常很大，每根针需要一个专属Home Position
+    \item \textbf{v8.0}：退让距离$\delta_m^*$根据实时冲突状态\textbf{动态计算}，仅退让到刚好解除冲突的位置。大多数情况下$\delta_m^*$远小于到Home Position的距离
+\end{itemize}
+\end{remark}
+
+\subsection{连续位置空间}
+
+\begin{remark}[位置空间的扩展]
+由于最小距离退让引入了任意连续退让位置，针的实际位置不再仅限于离散的细胞位置集合$\mathcal{C}$。系统中针可能处于以下位置类型：
+\begin{enumerate}
+    \item \textbf{细胞位置} $\mathbf{p}_c, \; c \in \mathcal{C}$：处理细胞时的精确位置
+    \item \textbf{退让位置} $\mathbf{p}_m^{\text{ret}}(\mathbf{p}_c, \delta)$：从某细胞位置沿退让轴后退$\delta$距离后的任意位置
+    \item \textbf{初始位置} $\mathbf{p}_m^{\text{init}}$：每根针的物理初始位置
+\end{enumerate}
+因此，\textbf{不可能预先枚举所有位置对的冲突关系}。碰撞检测必须在仿真过程中基于实时针位置进行\textbf{在线计算}。
+\end{remark}
+
+%==============================================================================
+\section{符号定义}
+%==============================================================================
+
+\subsection{集合与索引}
+
+\begin{align}
+    \mathcal{M} &= \{1, 2, \ldots, M\} && \text{针的集合（同时也是颜色集合）} \\
+    \mathcal{C} &= \{1, 2, \ldots, N\} && \text{所有工作细胞的集合} \\
+    \mathcal{C}_m &\subseteq \mathcal{C} && \text{分配给针$m$的细胞子集} \\
+    && & \bigcup_{m \in \mathcal{M}} \mathcal{C}_m = \mathcal{C}, \quad \mathcal{C}_i \cap \mathcal{C}_j = \emptyset \; (i \neq j) \\
+    n_m &= |\mathcal{C}_m| && \text{针$m$需要处理的细胞数量}
+\end{align}
+
+注意：v8.0中不再定义离散的退让点集合$\mathcal{R}$和离散位置全集$\mathcal{L}$。所有位置均为$\mathbb{R}^3$中的连续坐标。
+
+\subsection{几何与位置参数}
+
+\subsubsection{细胞位置}
+\begin{align}
+    \mathbf{p}_c &= (x_c, y_c, z_c) \in \mathbb{R}^3 && \text{细胞$c \in \mathcal{C}$的三维坐标}
+\end{align}
+
+\subsubsection{针的安装参数}
+\begin{align}
+    \theta_m^{XY} &\in [0, 2\pi) && \text{针$m$在XY平面的安装角度（水平方位角）} \\
+    \theta_m^{Z} &\in [0, \pi/2] && \text{针$m$的俯仰安装角度（与水平面夹角）} \\
+    L_m &\in \mathbb{R}^+ && \text{针$m$的有效长度（从针尖到针座）} \\
+    \mathbf{p}_m^{\text{init}} &\in \mathbb{R}^3 && \text{针$m$的物理初始位置（针尖坐标）}
+\end{align}
+
+\subsubsection{针的方向向量与退让方向}
+针$m$的单位方向向量（从针尖指向针座）：
+\begin{equation}
+    \mathbf{d}_m = \begin{pmatrix}
+        \cos\theta_m^{Z} \cdot \cos\theta_m^{XY} \\
+        \cos\theta_m^{Z} \cdot \sin\theta_m^{XY} \\
+        \sin\theta_m^{Z}
+    \end{pmatrix}
+\end{equation}
+退让方向默认与针安装方向一致：$\mathbf{d}_m^{\text{ret}} = \mathbf{d}_m$。若实际硬件退让方向不同（例如纯$Z$轴提升），可独立定义$\mathbf{d}_m^{\text{ret}}$。
+
+\subsection{针几何模型（连续坐标参数化）}
+
+\begin{definition}[针在任意位置的几何表示]
+针$m$的针尖位于\textbf{任意}三维坐标$\mathbf{p} \in \mathbb{R}^3$时，其几何状态定义为：
+\begin{align}
+    \mathbf{T}_m(\mathbf{p}) &= \mathbf{p} && \text{针尖位置} \\
+    \mathbf{B}_m(\mathbf{p}) &= \mathbf{p} + L_m \cdot \mathbf{d}_m && \text{针座位置} \\
+    \text{Needle}_m(\mathbf{p}) &= \overline{\mathbf{T}_m(\mathbf{p})\,\mathbf{B}_m(\mathbf{p})} && \text{针的线段表示}
+\end{align}
+注意：参数为连续坐标$\mathbf{p} \in \mathbb{R}^3$，而非v7.3中的离散位置索引$\ell \in \mathcal{L}$。这是支撑连续退让位置和实时碰撞检测的关键变化。
+\end{definition}
+
+\subsection{时间与速度参数}
+
+\begin{align}
+    t^{\text{find}} &\in \mathbb{R}^+ && \text{Find阶段固定耗时（不含移动时间）} \\
+    t^{\text{wait}} &\in \mathbb{R}^+ && \text{Wait阶段固定耗时} \\
+    t^{\text{total}} &= t^{\text{find}} + t^{\text{wait}} && \text{处理单个细胞的总固定耗时} \\
+    v &\in \mathbb{R}^+ && \text{针的移动速度（假设匀速）}
+\end{align}
+
+\subsection{距离与移动时间计算}
+
+\begin{definition}[欧氏距离]
+任意两个三维坐标之间的欧氏距离：
+\begin{equation}
+    d(\mathbf{p}_1, \mathbf{p}_2) = \|\mathbf{p}_1 - \mathbf{p}_2\|
+\end{equation}
+\end{definition}
+
+\begin{definition}[移动时间]
+针从位置$\mathbf{p}_1$移动到位置$\mathbf{p}_2$所需时间：
+\begin{equation}
+    t^{\text{move}}(\mathbf{p}_1, \mathbf{p}_2) = \frac{d(\mathbf{p}_1, \mathbf{p}_2)}{v}
+\end{equation}
+\end{definition}
+
+\subsection{碰撞检测参数}
+
+\begin{align}
+    D^{\text{tip}} &\in \mathbb{R}^+ && \text{针尖安全距离} \\
+    D^{\text{body}} &\in \mathbb{R}^+ && \text{针身安全距离} \\
+    \delta_{\max} &\in \mathbb{R}^+ && \text{退让距离上界}
+\end{align}
+
+\subsubsection{几何距离计算}
+
+\begin{definition}[点到线段距离]
+点$\mathbf{P}$到线段$\overline{\mathbf{AB}}$的最短距离：
+\begin{equation}
+    d_{\text{pt-seg}}(\mathbf{P}, \mathbf{A}, \mathbf{B}) = \min_{t \in [0,1]} \|\mathbf{P} - (\mathbf{A} + t(\mathbf{B} - \mathbf{A}))\|
+\end{equation}
+\end{definition}
+
+\begin{definition}[线段到线段距离]
+两线段$\overline{\mathbf{A}_1\mathbf{B}_1}$和$\overline{\mathbf{A}_2\mathbf{B}_2}$的最短距离：
+\begin{equation}
+    d_{\text{seg-seg}}(\mathbf{A}_1, \mathbf{B}_1, \mathbf{A}_2, \mathbf{B}_2) = \min_{s,t \in [0,1]} \|(\mathbf{A}_1 + s(\mathbf{B}_1 - \mathbf{A}_1)) - (\mathbf{A}_2 + t(\mathbf{B}_2 - \mathbf{A}_2))\|
+\end{equation}
+\end{definition}
+
+%==============================================================================
+\section{实时碰撞检测系统} \label{sec:collision}
+%==============================================================================
+
+\subsection{设计动机：为何弃用预计算冲突矩阵}
+
+v7.3版本采用预计算的四维离散冲突矩阵 $K(m,u,q,w)$，其中$u, w$来自有限的位置集合$\mathcal{L} = \mathcal{C} \cup \mathcal{R}$。该方案在v8.0中不再适用，原因如下：
+
+\begin{enumerate}
+    \item \textbf{退让位置连续化}：最小距离退让产生的退让位置$\mathbf{p}_m^{\text{ret}}(\mathbf{p}_c, \delta_m^*)$不是预设的离散点，$\delta_m^*$取决于仿真运行时的实时状态，事前无法枚举
+    \item \textbf{位置空间无界}：即使对退让距离做离散化（如步长$\Delta\delta$），位置数量也从$|\mathcal{L}|$膨胀为$|\mathcal{C}| \times \lceil \delta_{\max}/\Delta\delta \rceil$，冲突矩阵规模指数膨胀
+    \item \textbf{位置依赖于运行状态}：不同调度方案中同一针在同一细胞后的退让距离可能不同，因为退让距离取决于当时其他针的位置
+\end{enumerate}
+
+因此，v8.0采用\textbf{实时在线碰撞检测函数}替代预计算矩阵。
+
+\subsection{实时冲突判定函数}
+
+\begin{definition}[实时几何冲突函数]
+对于两根不同的针 $m, q \in \mathcal{M}$ ($m \neq q$)，针尖分别位于任意三维坐标 $\mathbf{p}, \mathbf{p}' \in \mathbb{R}^3$：
+\begin{equation}
+    \textsc{Conflict}(m, \mathbf{p}, \; q, \mathbf{p}') \in \{0, 1\}
+\end{equation}
+当且仅当针$m$在$\mathbf{p}$与针$q$在$\mathbf{p}'$存在几何干涉时返回$1$。
+\end{definition}
+
+\subsection{冲突判定的三重准则}
+
+给定针$m$针尖在$\mathbf{p}$、针$q$针尖在$\mathbf{p}'$，按以下步骤判定：
+
+\subsubsection{准则1：针尖-针尖冲突}
+\begin{equation}
+    \text{Conflict}_{\text{tip-tip}}(m,\mathbf{p},q,\mathbf{p}') = \mathbb{I}\left[ \|\mathbf{T}_m(\mathbf{p}) - \mathbf{T}_q(\mathbf{p}')\| < D^{\text{tip}} \right]
+\end{equation}
+
+\subsubsection{准则2：针尖-针身冲突}
+\begin{align}
+    \text{Conflict}_{\text{tip-body}}(m,\mathbf{p},q,\mathbf{p}') = \mathbb{I}\Big[ &d_{\text{pt-seg}}\big(\mathbf{T}_m(\mathbf{p}),\; \mathbf{T}_q(\mathbf{p}'),\; \mathbf{B}_q(\mathbf{p}')\big) < D^{\text{tip}} \nonumber \\
+    \lor \; &d_{\text{pt-seg}}\big(\mathbf{T}_q(\mathbf{p}'),\; \mathbf{T}_m(\mathbf{p}),\; \mathbf{B}_m(\mathbf{p})\big) < D^{\text{tip}} \Big]
+\end{align}
+
+\subsubsection{准则3：针身-针身冲突}
+\begin{equation}
+    \text{Conflict}_{\text{body-body}}(m,\mathbf{p},q,\mathbf{p}') = \mathbb{I}\left[ d_{\text{seg-seg}}\big(\mathbf{T}_m(\mathbf{p}), \mathbf{B}_m(\mathbf{p}), \mathbf{T}_q(\mathbf{p}'), \mathbf{B}_q(\mathbf{p}')\big) < D^{\text{body}} \right]
+\end{equation}
+
+\subsubsection{综合判定}
+\begin{equation}
+    \textsc{Conflict}(m, \mathbf{p}, q, \mathbf{p}') = \max\left( \text{Conflict}_{\text{tip-tip}},\; \text{Conflict}_{\text{tip-body}},\; \text{Conflict}_{\text{body-body}} \right)
+\end{equation}
+
+\subsection{全局安全性判定}
+
+\begin{definition}[位置安全性]
+针$m$在位置$\mathbf{p}$处相对于系统中所有其他针是否安全：
+\begin{equation}
+    \textsc{IsSafe}(m, \mathbf{p}, \tau) = \bigwedge_{q \in \mathcal{M} \setminus \{m\}} \left[ \textsc{Conflict}\big(m, \mathbf{p}, \; q, \textsc{ActualPos}_q(\tau)\big) = 0 \right]
+\end{equation}
+其中 $\textsc{ActualPos}_q(\tau) \in \mathbb{R}^3$ 是针$q$在时刻$\tau$的实际针尖坐标。
+\end{definition}
+
+\subsection{最小退让距离的计算算法} \label{sec:min_delta}
+
+\begin{algorithm}[H]
+\caption{最小安全退让距离计算 (ComputeMinRetract)}
+\begin{algorithmic}[1]
+\Require 针$m$、当前针尖位置$\mathbf{p}$、时刻$\tau$、搜索步长$\Delta\delta$
+\Ensure 最小退让距离$\delta^*$
+
+\If{$\textsc{IsSafe}(m, \mathbf{p}, \tau)$}
+    \State \Return $0$ \Comment{当前已安全，无需退让}
+\EndIf
+
+\State $\delta \leftarrow 0$
+\While{$\delta \leq \delta_{\max}$}
+    \State $\delta \leftarrow \delta + \Delta\delta$
+    \State $\mathbf{p}' \leftarrow \mathbf{p} + \delta \cdot \mathbf{d}_m^{\text{ret}}$
+    \If{$\textsc{IsSafe}(m, \mathbf{p}', \tau)$}
+        \State \Return $\delta$ \Comment{找到最小安全距离}
+    \EndIf
+\EndWhile
+\State \Return $\delta_{\max}$ \Comment{兜底：退到最大距离}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[二分搜索加速]
+上述线性搜索可改为二分搜索以提高效率。核心观察：当$\delta$增大时，冲突关系通常是单调递减的（退得越远越安全）。若冲突函数关于$\delta$单调，可使用二分法将搜索复杂度从$O(\delta_{\max}/\Delta\delta)$降至$O(\log(\delta_{\max}/\Delta\delta))$。
+
+具体地，先检查$\delta = 0$和$\delta = \delta_{\max}$两端：若$\delta = 0$已安全则返回$0$；若$\delta = \delta_{\max}$仍不安全则报错。否则在$[0, \delta_{\max}]$上二分搜索冲突函数从$1$变为$0$的临界点，搜索精度为$\Delta\delta$。
+\end{remark}
+
+\begin{remark}[解析求解的可能性]
+对于某些简单几何构型（如所有针平行），$\delta_m^*$可通过解析方法直接求解，避免数值搜索。此时将冲突距离条件（针尖距离$\geq D^{\text{tip}}$、线段距离$\geq D^{\text{body}}$）表示为关于$\delta$的不等式，求解最小满足$\delta$即可。
+\end{remark}
+
+%==============================================================================
+\section{决策变量（NSGA-II编码体系）}
+%==============================================================================
+
+为适配进化算法（NSGA-II），决策变量分为\textbf{序列层}和\textbf{策略层}两部分。
+
+\subsection{序列决策变量（排列编码）}
+
+\begin{definition}[访问序列]
+对于每根针 $m \in \mathcal{M}$，定义其细胞处理顺序为一个排列：
+\begin{equation}
+    \pi_m = (\pi_m^{(1)}, \pi_m^{(2)}, \ldots, \pi_m^{(n_m)})
+\end{equation}
+其中 $\pi_m^{(k)} \in \mathcal{C}_m$ 表示针$m$处理的第$k$个细胞，且$\{\pi_m^{(1)}, \ldots, \pi_m^{(n_m)}\} = \mathcal{C}_m$（即为$\mathcal{C}_m$的一个全排列）。
+\end{definition}
+
+\begin{definition}[全局序列编码]
+将所有针的序列组合为全局序列向量：
+\begin{equation}
+    \boldsymbol{\pi} = (\pi_1, \pi_2, \ldots, \pi_M)
+\end{equation}
+编码长度为 $\sum_{m \in \mathcal{M}} n_m = N$。
+\end{definition}
+
+\subsection{策略决策变量（退让意向）}
+
+\begin{definition}[退让意向]
+对于每个细胞 $c \in \mathcal{C}$，定义二值退让意向变量：
+\begin{equation}
+    \beta_c \in \{0, 1\}
+\end{equation}
+其含义为：
+\begin{equation}
+    \beta_c = \begin{cases} 
+    1, & \text{针在完成细胞$c$的Wait阶段后，\textbf{执行最小距离退让}再前往下一目标} \\
+    0, & \text{针在完成细胞$c$的Wait阶段后，\textbf{尝试直接}前往下一目标}
+    \end{cases}
+\end{equation}
+注意：当$\beta_c = 1$时，实际退让距离$\delta_m^*$在仿真过程中\textbf{动态计算}（见定义\ref{def:min_retract}），不是回到固定的Home Position。
+\end{definition}
+
+\begin{definition}[全局退让策略]
+所有退让意向构成的向量：
+\begin{equation}
+    \boldsymbol{\beta} = (\beta_1, \beta_2, \ldots, \beta_N) \in \{0,1\}^N
+\end{equation}
+\end{definition}
+
+\subsection{完整个体编码}
+
+一个完整的调度方案（个体）由序列和退让策略共同定义：
+\begin{equation}
+    \mathbf{X} = (\boldsymbol{\pi}, \boldsymbol{\beta})
+\end{equation}
+
+%==============================================================================
+\section{轨迹模型}
+%==============================================================================
+
+\subsection{目标细胞序列（静态）}
+
+给定针$m$的访问序列$\pi_m = (c_1, c_2, \ldots, c_{n_m})$，其\textbf{目标细胞序列}为：
+\begin{equation}
+    \mathcal{S}_m = (c_1, c_2, \ldots, c_{n_m})
+\end{equation}
+这是调度层确定的"要去哪些细胞、以什么顺序"。
+
+\subsection{实际轨迹（动态展开）}
+
+与v7.3不同，v8.0中\textbf{实际轨迹不再在仿真前静态生成}。因为退让位置$\mathbf{p}_m^{\text{ret}}(\mathbf{p}_{c_k}, \delta_m^*)$取决于仿真运行时的实时系统状态。
+
+实际轨迹在仿真过程中逐步展开。对于第$k$个细胞到第$k+1$个细胞之间的过渡：
+
+\begin{equation}
+    c_k \xrightarrow{\text{完成Wait}} \begin{cases}
+    \text{直接} \longrightarrow c_{k+1} & \text{若 } \beta_{c_k} = 0 \\[8pt]
+    \text{退让} \longrightarrow \mathbf{p}_m^{\text{ret}}(\mathbf{p}_{c_k}, \delta_m^*) \longrightarrow c_{k+1} & \text{若 } \beta_{c_k} = 1
+    \end{cases}
+\end{equation}
+
+\subsection{轨迹元素类型}
+
+仿真中，针$m$依次经过的位置节点可分为三种类型：
+
+\begin{equation}
+    \text{NodeType} = \begin{cases}
+    \texttt{INIT}, & \text{初始位置 } \mathbf{p}_m^{\text{init}} \text{（仿真起点）} \\
+    \texttt{CELL}, & \text{细胞位置 } \mathbf{p}_{c_k} \text{（需要执行Find+Wait）} \\
+    \texttt{RETRACTED}, & \text{退让位置 } \mathbf{p}_m^{\text{ret}}(\mathbf{p}_{c_k}, \delta_m^*) \text{（仅过渡，无操作）}
+    \end{cases}
+\end{equation}
+
+%==============================================================================
+\section{系统状态与动态仿真模型} \label{sec:state}
+%==============================================================================
+
+本模型采用离散事件仿真来评估调度方案的可行性和性能。
+
+\subsection{系统状态定义}
+
+\begin{definition}[系统状态]
+在仿真时刻$\tau \geq 0$，系统状态$\mathbf{S}(\tau)$由以下部分组成：
+
+\textbf{1. 全局资源状态：}
+\begin{equation}
+    \text{CameraStatus}(\tau) \in \{\texttt{FREE}, \texttt{BUSY}\}
+\end{equation}
+
+\textbf{2. 每根针的状态} $\forall m \in \mathcal{M}$：
+\begin{align}
+    \textsc{ActualPos}_m(\tau) &\in \mathbb{R}^3 && \text{针尖的\textbf{实际}三维坐标} \\
+    \text{Phase}_m(\tau) &\in \Phi && \text{当前阶段} \\
+    \text{CellPtr}_m(\tau) &\in \{0, 1, \ldots, n_m\} && \text{细胞指针（已完成的细胞数）} \\
+    \text{NextEventTime}_m(\tau) &\in \mathbb{R}_{\geq 0} \cup \{+\infty\} && \text{下一事件发生时间}
+\end{align}
+\end{definition}
+
+\begin{remark}[与v7.3的关键差异——连续位置]
+\begin{itemize}
+    \item v7.3中：$\text{Loc}_m(\tau) \in \mathcal{L}$（离散位置索引）
+    \item v8.0中：$\textsc{ActualPos}_m(\tau) \in \mathbb{R}^3$（连续三维坐标）
+\end{itemize}
+这一变化直接反映了"针可能处于任意退让位置"的物理现实。
+\end{remark}
+
+\begin{definition}[针的阶段集合]
+\begin{equation}
+    \Phi = \{\texttt{IDLE}, \texttt{MOVING}, \texttt{FINDING}, \texttt{WAITING}, \texttt{RETRACTING}, \texttt{BLOCKED}, \texttt{FINISHED}\}
+\end{equation}
+各阶段含义：
+\begin{itemize}
+    \item \texttt{IDLE}：空闲，等待开始或等待前往下一目标
+    \item \texttt{MOVING}：正在向目标细胞移动中
+    \item \texttt{FINDING}：正在执行Find阶段（占用相机）
+    \item \texttt{WAITING}：正在执行Wait阶段（不占相机，占用空间）
+    \item \texttt{RETRACTING}：正在执行最小距离退让移动（不占相机，不需要目标细胞准入）
+    \item \texttt{BLOCKED}：被阻塞，因资源或空间冲突无法行动
+    \item \texttt{FINISHED}：已完成所有任务
+\end{itemize}
+\end{definition}
+
+\begin{remark}[\texttt{RETRACTING}阶段的特殊性]
+退让移动是纯粹的空间腾让动作：
+\begin{itemize}
+    \item \textbf{不}需要相机资源
+    \item \textbf{不}需要对目标位置做准入检查（因为退让方向经过安全距离计算，保证退让终点无冲突）
+    \item 退让完成后，针处于退让位置$\mathbf{p}_m^{\text{ret}}$，进入\texttt{IDLE}状态，等待前往下一个细胞
+\end{itemize}
+\end{remark}
+
+\subsection{位置锁定规则}
+
+\begin{remark}[保守位置锁定——连续坐标版]
+当针$m$开始向目标坐标$\mathbf{p}_{\text{dest}}$移动时，立即将$\textsc{ActualPos}_m$更新为$\mathbf{p}_{\text{dest}}$。这确保其他针在进行碰撞检测时，会保守地将$m$视为已占据目标位置，防止两针同时向冲突区域移动。
+\end{remark}
+
+\subsection{状态转移规则}
+
+\subsubsection{准入条件（Admission Criteria）——使用实时碰撞检测}
+
+针$m$当前在位置$\textsc{ActualPos}_m(\tau)$，尝试移动到目标位置$\mathbf{p}_{\text{dest}}$时，需满足：
+
+\textbf{条件1：资源可用性}
+\begin{equation}
+    \text{ResourceReady}(\mathbf{p}_{\text{dest}}) = \begin{cases}
+    \text{CameraStatus}(\tau) = \texttt{FREE}, & \text{若目标是细胞位置（需要相机）} \\
+    \texttt{TRUE}, & \text{若目标是退让位置（无需相机）}
+    \end{cases}
+\end{equation}
+
+\textbf{条件2：目标位置实时安全性}
+\begin{equation}
+    \text{EndpointSafe}(m, \mathbf{p}_{\text{dest}}, \tau) = \textsc{IsSafe}(m, \mathbf{p}_{\text{dest}}, \tau)
+\end{equation}
+即使用第\ref{sec:collision}节的实时碰撞检测函数，判断目标位置与所有其他针当前实际位置是否无冲突。
+
+\textbf{综合准入判定：}
+\begin{equation}
+    \text{CanMove}(m, \mathbf{p}_{\text{dest}}, \tau) = \text{ResourceReady}(\mathbf{p}_{\text{dest}}) \land \text{EndpointSafe}(m, \mathbf{p}_{\text{dest}}, \tau)
+\end{equation}
+
+\subsubsection{状态转移动作}
+
+根据准入判定结果：
+
+\textbf{情况1：准入通过}（$\text{CanMove} = \texttt{TRUE}$）
+\begin{enumerate}
+    \item 立即锁定目标位置：$\textsc{ActualPos}_m \leftarrow \mathbf{p}_{\text{dest}}$
+    \item 若目标是细胞，锁定相机：$\text{CameraStatus} \leftarrow \texttt{BUSY}$
+    \item 更新阶段：$\text{Phase}_m \leftarrow \texttt{MOVING}$
+    \item 计算移动完成时间：$\text{NextEventTime}_m \leftarrow \tau + t^{\text{move}}(\mathbf{p}_{\text{old}}, \mathbf{p}_{\text{dest}})$
+\end{enumerate}
+
+\textbf{情况2：准入失败}（$\text{CanMove} = \texttt{FALSE}$）
+\begin{enumerate}
+    \item 保持当前位置：$\textsc{ActualPos}_m$ 不变
+    \item 更新阶段：$\text{Phase}_m \leftarrow \texttt{BLOCKED}$
+    \item 记录阻塞开始时间（用于计算阻塞时长）
+\end{enumerate}
+
+\subsubsection{阶段完成后的状态转移}
+
+\textbf{移动完成}（\texttt{MOVING}结束，到达细胞$c_k$）：
+\begin{itemize}
+    \item 进入Find阶段：$\text{Phase}_m \leftarrow \texttt{FINDING}$
+    \item $\text{NextEventTime}_m \leftarrow \tau + t^{\text{find}}$
+\end{itemize}
+
+\textbf{Find阶段完成}：
+\begin{itemize}
+    \item 释放相机：$\text{CameraStatus} \leftarrow \texttt{FREE}$
+    \item 进入Wait阶段：$\text{Phase}_m \leftarrow \texttt{WAITING}$
+    \item $\text{NextEventTime}_m \leftarrow \tau + t^{\text{wait}}$
+\end{itemize}
+
+\textbf{Wait阶段完成}（细胞$c_k$处理完毕）：
+\begin{itemize}
+    \item 更新细胞指针：$\text{CellPtr}_m \leftarrow \text{CellPtr}_m + 1$
+    \item 若已完成所有细胞（$\text{CellPtr}_m = n_m$）：$\text{Phase}_m \leftarrow \texttt{FINISHED}$
+    \item 否则，根据退让意向进行分支处理（见下文第\ref{sec:wait_complete}节）
+\end{itemize}
+
+\textbf{退让移动完成}（\texttt{RETRACTING}结束）：
+\begin{itemize}
+    \item 到达退让位置（$\textsc{ActualPos}_m$已在退让启动时更新）
+    \item 进入空闲：$\text{Phase}_m \leftarrow \texttt{IDLE}$
+    \item 尝试前往下一细胞
+\end{itemize}
+
+\subsection{Wait阶段完成后的退让分支逻辑} \label{sec:wait_complete}
+
+当针$m$在细胞$c_k$完成Wait阶段且还有后续细胞$c_{k+1}$时：
+
+\begin{algorithm}[H]
+\caption{Wait完成后的退让决策逻辑 (PostWaitDispatch)}
+\begin{algorithmic}[1]
+\Require 针$m$，当前位置$\mathbf{p}_{c_k}$，退让意向$\beta_{c_k}$，下一目标$c_{k+1}$，时刻$\tau$
+\Ensure 下一步动作
+
+\If{$\beta_{c_k} = 0$} \Comment{不退让，尝试直接前进}
+    \State $\mathbf{p}_{\text{dest}} \leftarrow \mathbf{p}_{c_{k+1}}$
+    \If{$\text{CanMove}(m, \mathbf{p}_{\text{dest}}, \tau)$}
+        \State 启动移动到$c_{k+1}$（正常\texttt{MOVING}）
+    \Else
+        \State $\text{Phase}_m \leftarrow \texttt{BLOCKED}$
+    \EndIf
+\ElsIf{$\beta_{c_k} = 1$} \Comment{需要退让}
+    \State $\delta^* \leftarrow \textsc{ComputeMinRetract}(m, \mathbf{p}_{c_k}, \tau)$ \Comment{计算最小退让距离}
+    \If{$\delta^* = 0$}  \Comment{无冲突，无需实际退让}
+        \State 按$\beta_{c_k} = 0$逻辑处理（尝试直接前进）
+    \Else
+        \State $\mathbf{p}_{\text{ret}} \leftarrow \mathbf{p}_{c_k} + \delta^* \cdot \mathbf{d}_m^{\text{ret}}$
+        \State $\textsc{ActualPos}_m \leftarrow \mathbf{p}_{\text{ret}}$ \Comment{锁定退让目标}
+        \State $\text{Phase}_m \leftarrow \texttt{RETRACTING}$
+        \State $\text{NextEventTime}_m \leftarrow \tau + t^{\text{move}}(\mathbf{p}_{c_k}, \mathbf{p}_{\text{ret}})$
+    \EndIf
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{死锁检测}
+
+\begin{definition}[死锁状态]
+当满足以下所有条件时，判定系统进入死锁：
+\begin{enumerate}
+    \item 所有未完成的针都处于$\texttt{BLOCKED}$状态
+    \item 没有任何针处于$\texttt{MOVING}$、$\texttt{FINDING}$、$\texttt{WAITING}$或$\texttt{RETRACTING}$状态
+    \item 相机为$\texttt{FREE}$状态
+\end{enumerate}
+\end{definition}
+
+死锁意味着当前调度方案不可行，需要在适应度函数中给予惩罚。
+
+%==============================================================================
+\section{多目标优化函数}
+%==============================================================================
+
+\begin{equation}
+    \min_{(\boldsymbol{\pi}, \boldsymbol{\beta})} \mathbf{F} = (f_1, f_2, f_3, f_4)^T
+\end{equation}
+
+\subsection{目标1：最大完成时间（Makespan）}
+
+\begin{equation}
+    f_1 = C_{\max} = \max_{m \in \mathcal{M}} \left( \text{FinishTime}_m \right) + P_{\text{deadlock}}
+\end{equation}
+
+其中$\text{FinishTime}_m$是针$m$完成最后一个细胞Wait阶段的时刻。
+
+\begin{equation}
+    P_{\text{deadlock}} = \begin{cases}
+    H_{\text{penalty}}, & \text{若检测到死锁} \\
+    0, & \text{否则}
+    \end{cases}
+\end{equation}
+
+\subsection{目标2：总移动距离}
+
+总移动距离为仿真过程中所有针\textbf{实际移动}的欧氏距离之和，包含退让移动：
+
+\begin{equation}
+    f_2 = D_{\text{total}} = \sum_{m \in \mathcal{M}} D_m^{\text{actual}}
+\end{equation}
+
+其中$D_m^{\text{actual}}$是仿真中针$m$所有移动段的距离累计：
+\begin{equation}
+    D_m^{\text{actual}} = \sum_{j=1}^{J_m} d\big(\mathbf{p}_m^{(j-1)}, \mathbf{p}_m^{(j)}\big)
+\end{equation}
+$J_m$为针$m$的实际移动段数（包含正常移动和退让移动），$\mathbf{p}_m^{(j)}$为第$j$段移动的终点坐标。
+
+\begin{remark}
+由于退让距离是动态最小化的，v8.0中$D_{\text{total}}$的退让贡献通常显著小于v7.3（后者每次退让都返回远处的Home Position）。
+\end{remark}
+
+\subsection{目标3：退让操作次数}
+
+实际发生的退让操作次数（仿真中$\delta^* > 0$的退让）：
+
+\begin{equation}
+    f_3 = N_{\text{retract}} = \sum_{m \in \mathcal{M}} \big|\{k : \beta_{\pi_m^{(k)}} = 1 \text{ 且仿真中 } \delta_m^*(\mathbf{p}_{\pi_m^{(k)}}, \tau_k) > 0\}\big|
+\end{equation}
+
+\begin{remark}
+即使$\beta_c = 1$，若运行时计算得$\delta^* = 0$（当前无冲突），则该退让不实际执行、不计入次数。
+\end{remark}
+
+\subsection{目标4：总阻塞时间}
+
+\begin{equation}
+    f_4 = T_{\text{blocked}} = \sum_{m \in \mathcal{M}} \sum_{b \in \text{BlockEvents}_m} (\tau_b^{\text{end}} - \tau_b^{\text{start}})
+\end{equation}
+
+%==============================================================================
+\section{Pareto最优与求解框架}
+%==============================================================================
+
+\subsection{支配关系}
+
+\begin{definition}[Pareto支配]
+解$\mathbf{X}^1$支配解$\mathbf{X}^2$（记作$\mathbf{X}^1 \prec \mathbf{X}^2$）当且仅当：
+\begin{equation}
+    \forall i \in \{1,2,3,4\}: f_i(\mathbf{X}^1) \leq f_i(\mathbf{X}^2) \quad \land \quad \exists j \in \{1,2,3,4\}: f_j(\mathbf{X}^1) < f_j(\mathbf{X}^2)
+\end{equation}
+\end{definition}
+
+\subsection{Pareto最优解集}
+
+\begin{equation}
+    \mathcal{P}^* = \left\{ \mathbf{X}^* \in \mathcal{X} \; \middle| \; \nexists \mathbf{X} \in \mathcal{X}: \mathbf{X} \prec \mathbf{X}^* \right\}
+\end{equation}
+
+\subsection{NSGA-II算法框架}
+
+\begin{algorithm}[H]
+\caption{NSGA-II主框架}
+\begin{algorithmic}[1]
+\Require 种群大小$N_{\text{pop}}$，最大代数$G_{\max}$，交叉率$p_c$，变异率$p_m$
+\Ensure Pareto最优解集
+
+\State 初始化种群 $\mathcal{P}_0 = \{\mathbf{X}_1, \ldots, \mathbf{X}_{N_{\text{pop}}}\}$
+\State 对每个个体计算适应度（通过仿真）
+\For{$g = 1$ to $G_{\max}$}
+    \State 二元锦标赛选择
+    \State 交叉操作：序列部分使用PMX/OX，二值部分使用均匀交叉
+    \State 变异操作：序列部分使用交换/插入变异，二值部分使用位翻转
+    \State 对子代计算适应度
+    \State 合并父代与子代
+    \State 非支配排序
+    \State 拥挤度计算
+    \State 选择下一代（优先选择低前沿，同前沿选择高拥挤度）
+\EndFor
+\State \Return 第一前沿解集
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================================
+\section{适应度评估算法（仿真解码器）}
+%==============================================================================
+
+\begin{algorithm}[H]
+\caption{适应度评估 (EvaluateIndividual) —— v8.0版}
+\begin{algorithmic}[1]
+\Require 个体编码$(\boldsymbol{\pi}, \boldsymbol{\beta})$，针几何参数，时间参数，碰撞安全距离
+\Ensure 目标函数值$(f_1, f_2, f_3, f_4)$
+
+\State \textbf{// 阶段1：初始化仿真状态}
+\State $\tau \leftarrow 0$, \; $\text{CameraStatus} \leftarrow \texttt{FREE}$
+\State $\text{totalDist} \leftarrow 0$, \; $\text{retractCount} \leftarrow 0$
+\For{each $m \in \mathcal{M}$}
+    \State $\textsc{ActualPos}_m \leftarrow \mathbf{p}_m^{\text{init}}$
+    \State $\text{CellPtr}_m \leftarrow 0$, \; $\text{Phase}_m \leftarrow \texttt{IDLE}$
+    \State $\text{BlockedTime}_m \leftarrow 0$
+\EndFor
+
+\State \textbf{// 阶段2：事件驱动仿真主循环}
+\While{$\exists m: \text{Phase}_m \neq \texttt{FINISHED}$}
+    
+    \State \textbf{// 2.1 推进到最近事件}
+    \State $\tau_{\text{next}} \leftarrow \min_{m: \text{Phase}_m \in \{\texttt{MOVING}, \texttt{FINDING}, \texttt{WAITING}, \texttt{RETRACTING}\}} \text{NextEventTime}_m$
+    \State $\tau \leftarrow \tau_{\text{next}}$
+    
+    \State \textbf{// 2.2 处理在$\tau$到期的事件}
+    \For{each $m$ with $\text{NextEventTime}_m = \tau$ and active phase}
+        \If{$\text{Phase}_m = \texttt{MOVING}$}
+            \State 到达细胞 $\rightarrow$ $\text{Phase}_m \leftarrow \texttt{FINDING}$, \; $\text{NextEventTime}_m \leftarrow \tau + t^{\text{find}}$
+        \ElsIf{$\text{Phase}_m = \texttt{FINDING}$}
+            \State $\text{CameraStatus} \leftarrow \texttt{FREE}$
+            \State $\text{Phase}_m \leftarrow \texttt{WAITING}$, \; $\text{NextEventTime}_m \leftarrow \tau + t^{\text{wait}}$
+        \ElsIf{$\text{Phase}_m = \texttt{WAITING}$}
+            \State $\text{CellPtr}_m \leftarrow \text{CellPtr}_m + 1$
+            \If{$\text{CellPtr}_m = n_m$}
+                \State $\text{Phase}_m \leftarrow \texttt{FINISHED}$
+            \Else
+                \State 执行 \textsc{PostWaitDispatch}（算法2） \Comment{退让/前进分支}
+            \EndIf
+        \ElsIf{$\text{Phase}_m = \texttt{RETRACTING}$}
+            \State $\text{Phase}_m \leftarrow \texttt{IDLE}$ \Comment{退让完成，等待前往下一细胞}
+        \EndIf
+    \EndFor
+    
+    \State \textbf{// 2.3 尝试调度所有IDLE和BLOCKED的针}
+    \For{each $m$ with $\text{Phase}_m \in \{\texttt{IDLE}, \texttt{BLOCKED}\}$}
+        \If{$\text{CellPtr}_m < n_m$}
+            \State $c_{\text{next}} \leftarrow \pi_m^{(\text{CellPtr}_m + 1)}$
+            \State $\mathbf{p}_{\text{dest}} \leftarrow \mathbf{p}_{c_{\text{next}}}$
+            \If{$\text{CanMove}(m, \mathbf{p}_{\text{dest}}, \tau)$} \Comment{实时碰撞检测}
+                \State $\mathbf{p}_{\text{old}} \leftarrow \textsc{ActualPos}_m$
+                \State $\textsc{ActualPos}_m \leftarrow \mathbf{p}_{\text{dest}}$ \Comment{保守锁定}
+                \State $\text{CameraStatus} \leftarrow \texttt{BUSY}$
+                \State $\text{Phase}_m \leftarrow \texttt{MOVING}$
+                \State $\text{NextEventTime}_m \leftarrow \tau + t^{\text{move}}(\mathbf{p}_{\text{old}}, \mathbf{p}_{\text{dest}})$
+                \State $\text{totalDist} \mathrel{+}= d(\mathbf{p}_{\text{old}}, \mathbf{p}_{\text{dest}})$
+                \If{$\text{Phase}_m$ was \texttt{BLOCKED}}
+                    \State $\text{BlockedTime}_m \mathrel{+}= (\tau - \text{BlockStartTime}_m)$
+                \EndIf
+            \Else
+                \If{$\text{Phase}_m \neq \texttt{BLOCKED}$}
+                    \State $\text{Phase}_m \leftarrow \texttt{BLOCKED}$, \; $\text{BlockStartTime}_m \leftarrow \tau$
+                \EndIf
+            \EndIf
+        \EndIf
+    \EndFor
+    
+    \State \textbf{// 2.4 死锁检测}
+    \If{死锁条件满足}
+        \State \Return $(H_{\text{penalty}}, +\infty, f_3, +\infty)$
+    \EndIf
+\EndWhile
+
+\State \textbf{// 阶段3：汇总目标函数}
+\State $f_1 \leftarrow \max_{m} \text{FinishTime}_m$
+\State $f_2 \leftarrow \text{totalDist}$
+\State $f_3 \leftarrow \text{retractCount}$
+\State $f_4 \leftarrow \sum_m \text{BlockedTime}_m$
+
+\State \Return $(f_1, f_2, f_3, f_4)$
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================================
+\section{算法实现要点}
+%==============================================================================
+
+\subsection{数据结构设计}
+
+\subsubsection{细胞信息}
+\begin{verbatim}
+struct Cell {
+    int id;                 // 细胞编号 (1 to N)
+    int color;              // 所属颜色/针 (1 to M)
+    double x, y, z;         // 三维坐标
+};
+\end{verbatim}
+
+\subsubsection{针信息}
+\begin{verbatim}
+struct Needle {
+    int id;                 // 针编号 (1 to M)
+    double theta_xy;        // 水平安装角度
+    double theta_z;         // 俯仰安装角度
+    double length;          // 有效长度
+    Point3D direction;      // 单位方向向量 d_m
+    Point3D retract_dir;    // 退让方向（默认=direction）
+    Point3D init_pos;       // 初始位置
+    vector<int> cells;      // 分配的细胞列表
+};
+\end{verbatim}
+
+\subsubsection{个体编码}
+\begin{verbatim}
+struct Individual {
+    vector<vector<int>> sequences;  // M个排列
+    vector<bool> retractions;       // N个退让意向
+    array<double, 4> fitness;       // 4个目标函数值
+    int rank;                       // 非支配等级
+    double crowding_distance;       // 拥挤度
+};
+\end{verbatim}
+
+\subsubsection{仿真状态}
+\begin{verbatim}
+struct NeedleState {
+    Point3D actual_pos;     // 实际针尖三维坐标（连续）
+    Phase phase;            // 当前阶段
+    int cell_ptr;           // 细胞指针
+    double next_event_time; // 下一事件时间
+    double total_blocked;   // 累计阻塞时间
+    double block_start;     // 本次阻塞开始时间
+    double total_dist;      // 累计移动距离
+    int retract_count;      // 累计退让次数
+};
+
+enum Phase { IDLE, MOVING, FINDING, WAITING, RETRACTING, BLOCKED, FINISHED };
+\end{verbatim}
+
+\subsection{实时碰撞检测实现}
+
+\begin{algorithm}[H]
+\caption{实时碰撞检测函数实现}
+\begin{algorithmic}[1]
+\Function{Conflict}{needle $m$, pos $\mathbf{p}$, needle $q$, pos $\mathbf{p}'$}
+    \State $\mathbf{T}_m \leftarrow \mathbf{p}$, \quad $\mathbf{B}_m \leftarrow \mathbf{p} + L_m \cdot \mathbf{d}_m$
+    \State $\mathbf{T}_q \leftarrow \mathbf{p}'$, \quad $\mathbf{B}_q \leftarrow \mathbf{p}' + L_q \cdot \mathbf{d}_q$
+    
+    \If{$\|\mathbf{T}_m - \mathbf{T}_q\| < D^{\text{tip}}$} \Return \texttt{TRUE} \EndIf \Comment{针尖-针尖}
+    \If{$d_{\text{pt-seg}}(\mathbf{T}_m, \mathbf{T}_q, \mathbf{B}_q) < D^{\text{tip}}$} \Return \texttt{TRUE} \EndIf \Comment{针尖-针身}
+    \If{$d_{\text{pt-seg}}(\mathbf{T}_q, \mathbf{T}_m, \mathbf{B}_m) < D^{\text{tip}}$} \Return \texttt{TRUE} \EndIf
+    \If{$d_{\text{seg-seg}}(\mathbf{T}_m, \mathbf{B}_m, \mathbf{T}_q, \mathbf{B}_q) < D^{\text{body}}$} \Return \texttt{TRUE} \EndIf \Comment{针身-针身}
+    \State \Return \texttt{FALSE}
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[性能优化]
+实时碰撞检测在每次准入判定和退让距离计算时调用，需要保证效率：
+\begin{enumerate}
+    \item \textbf{快速排除}：先做针尖距离粗筛（最廉价的计算），不通过再做精细检测
+    \item \textbf{缓存几何量}：$\mathbf{B}_m(\mathbf{p}) = \mathbf{p} + L_m \cdot \mathbf{d}_m$中$L_m \cdot \mathbf{d}_m$为常量，可预计算
+    \item \textbf{调用频率控制}：碰撞检测仅在状态转移时刻触发，不在时间步之间重复检测
+    \item \textbf{仅检查相关针对}：若系统中$M$较小（通常$M \leq 6$），遍历所有针对的开销可接受；若$M$较大，可使用空间索引加速
+\end{enumerate}
+\end{remark}
+
+\subsection{关键参数建议值}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{参数} & \textbf{符号} & \textbf{建议值/范围} \\
+\hline
+Find阶段耗时 & $t^{\text{find}}$ & 60秒 \\
+Wait阶段耗时 & $t^{\text{wait}}$ & 240秒 \\
+针移动速度 & $v$ & 根据实际硬件设定 \\
+针尖安全距离 & $D^{\text{tip}}$ & 50-100微米 \\
+针身安全距离 & $D^{\text{body}}$ & 100-200微米 \\
+退让距离上界 & $\delta_{\max}$ & 根据针长和工作区域设定 \\
+退让搜索步长 & $\Delta\delta$ & 10-50微米 \\
+种群大小 & $N_{\text{pop}}$ & 100-200 \\
+最大代数 & $G_{\max}$ & 200-500 \\
+交叉率 & $p_c$ & 0.8-0.9 \\
+变异率 & $p_m$ & 0.1-0.2 \\
+死锁惩罚 & $H_{\text{penalty}}$ & $10^6$ \\
+\hline
+\end{tabular}
+\caption{算法参数建议值}
+\end{table}
+
+\textbf{可视化主要内容：}
+\begin{enumerate}
+    \item 执行摘要：关键指标、成功率、总体评估
+    \item 优化过程：收敛曲线、Pareto前沿、算法参数
+    \item 调度方案：甘特图（标注退让事件及退让距离$\delta^*$）、资源利用率、关键路径
+    \item 几何分析：3D轨迹快照（包含退让中间位置）、碰撞事件列表、退让距离分布统计、交互动画展示整个过程方便查看是否实际会发生交叉碰撞
+\end{enumerate}
+
+%==============================================================================
+\section{模型扩展讨论}
+%==============================================================================
+
+\subsection{2D简化模式}
+
+若忽略Z轴（所有细胞在同一平面），可简化碰撞检测：
+\begin{itemize}
+    \item 忽略$z$坐标和$\theta_m^Z$
+    \item 针简化为2D线段
+    \item 实时碰撞检测函数简化为2D几何运算
+\end{itemize}
+
+\subsection{动态退让决策（进一步扩展）}
+
+当前模型的退让意向$\beta_c$仍是静态编码的（在NSGA-II中预先决定）。可进一步扩展为\textbf{完全动态退让}：
+\begin{itemize}
+    \item 从编码中移除$\boldsymbol{\beta}$，退让完全由仿真器在运行时自动判定
+    \item 规则：当直接前进被阻塞时，自动计算$\delta_m^*$并执行退让
+    \item 优点：减少搜索空间维度（编码长度从$2N$降为$N$），退让决策更精准
+    \item 缺点：仿真器逻辑更复杂，可能出现"频繁小退让"的振荡行为
+    \item 可通过引入退让冷却时间或最小退让阈值来缓解振荡
+\end{itemize}
+
+\subsection{混合退让策略}
+
+可将$\beta_c$编码扩展为三值：
+\begin{equation}
+    \beta_c \in \{0, 1, 2\}
+\end{equation}
+\begin{itemize}
+    \item $\beta_c = 0$：不退让，直接前进
+    \item $\beta_c = 1$：最小距离退让（本文默认方案）
+    \item $\beta_c = 2$：全距离退让到$\delta_{\max}$（等价于完全退出工作区域，适用于严重拥堵场景）
+\end{itemize}
+
+%==============================================================================
+\section{v7.3 $\to$ v8.0 变更摘要}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{|l|p{5.5cm}|p{5.5cm}|}
+\hline
+\textbf{方面} & \textbf{v7.3} & \textbf{v8.0} \\
+\hline
+退让方式 & 回到固定Home Position $r_m$ & 沿退让轴最小距离$\delta_m^*$ \\
+\hline
+退让距离 & 固定（到$r_m$的距离） & 动态计算，仅退让到刚好消除冲突 \\
+\hline
+位置空间 & 离散集合 $\mathcal{L} = \mathcal{C} \cup \mathcal{R}$ & 连续空间 $\mathbb{R}^3$ \\
+\hline
+碰撞检测 & 预计算四维冲突矩阵 $K(m,u,q,w)$ & 实时在线碰撞检测函数 $\textsc{Conflict}(m,\mathbf{p},q,\mathbf{p}')$ \\
+\hline
+针位置表示 & 离散索引 $\text{Loc}_m \in \mathcal{L}$ & 连续坐标 $\textsc{ActualPos}_m \in \mathbb{R}^3$ \\
+\hline
+针几何参数 & $\mathbf{T}_m(\ell)$, 离散位置 & $\mathbf{T}_m(\mathbf{p})$, 连续坐标 \\
+\hline
+轨迹生成 & 静态展开含退让点 & 目标细胞序列静态，退让位置动态生成 \\
+\hline
+阶段集合 & 6个阶段 & 7个阶段（新增\texttt{RETRACTING}） \\
+\hline
+$\beta_c$语义 & 是否回到$r_m$ & 是否执行最小距离退让 \\
+\hline
+$f_3$计算 & $\sum \beta_c$ & 仿真中实际执行的退让次数（$\delta^*>0$） \\
+\hline
+$f_2$计算 & 静态轨迹距离和 & 仿真中实际移动距离累计 \\
+\hline
+\end{tabular}
+\caption{v7.3 $\to$ v8.0 核心变更对照表}
+\end{table}
+
+%==============================================================================
+\section{附录：数学符号汇总}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{|l|l|p{8cm}|}
+\hline
+\textbf{符号} & \textbf{类型} & \textbf{描述} \\
+\hline
+$M$ & 常数 & 针的数量（等于颜色数量） \\
+$N$ & 常数 & 细胞总数 \\
+$\mathcal{M}$ & 集合 & 针的索引集合 $\{1,\ldots,M\}$ \\
+$\mathcal{C}$ & 集合 & 细胞的索引集合 $\{1,\ldots,N\}$ \\
+$\mathcal{C}_m$ & 集合 & 分配给针$m$的细胞子集 \\
+\hline
+$\mathbf{p}_c$ & 向量 & 细胞$c$的三维坐标 \\
+$\mathbf{p}_m^{\text{init}}$ & 向量 & 针$m$的初始位置 \\
+$\theta_m^{XY}, \theta_m^Z$ & 参数 & 针$m$的安装角度 \\
+$L_m$ & 参数 & 针$m$的有效长度 \\
+$\mathbf{d}_m$ & 向量 & 针$m$的单位方向向量（针尖$\to$针座） \\
+$\mathbf{d}_m^{\text{ret}}$ & 向量 & 针$m$的退让方向（默认$= \mathbf{d}_m$） \\
+$\mathbf{T}_m(\mathbf{p}), \mathbf{B}_m(\mathbf{p})$ & 向量 & 针$m$针尖在$\mathbf{p}$时的针尖和针座坐标 \\
+\hline
+$t^{\text{find}}, t^{\text{wait}}$ & 参数 & Find和Wait阶段的固定耗时 \\
+$v$ & 参数 & 针的移动速度 \\
+$d(\cdot,\cdot)$ & 函数 & 欧氏距离函数 \\
+$t^{\text{move}}(\cdot,\cdot)$ & 函数 & 移动时间函数 \\
+\hline
+$D^{\text{tip}}, D^{\text{body}}$ & 参数 & 安全距离阈值 \\
+$\delta_{\max}$ & 参数 & 退让距离上界 \\
+$\Delta\delta$ & 参数 & 退让搜索步长 \\
+$\textsc{Conflict}(\cdot)$ & 函数 & 实时几何冲突判定函数（取代矩阵$K$） \\
+$\textsc{IsSafe}(\cdot)$ & 函数 & 全局安全性判定函数 \\
+\hline
+$\pi_m$ & 决策变量 & 针$m$的细胞访问序列（排列） \\
+$\beta_c$ & 决策变量 & 细胞$c$后是否执行最小距离退让（二值） \\
+$\mathcal{S}_m$ & 导出变量 & 针$m$的目标细胞序列 \\
+\hline
+$\textsc{ActualPos}_m(\tau)$ & 状态变量 & 时刻$\tau$针$m$的实际三维坐标 \\
+$\text{Phase}_m(\tau)$ & 状态变量 & 时刻$\tau$针$m$的阶段 \\
+$\text{CameraStatus}(\tau)$ & 状态变量 & 时刻$\tau$相机状态 \\
+$\text{CellPtr}_m(\tau)$ & 状态变量 & 时刻$\tau$针$m$已完成的细胞数 \\
+\hline
+$\mathbf{p}_m^{\text{ret}}(\mathbf{p}, \delta)$ & 导出量 & 从$\mathbf{p}$退让$\delta$后的针尖位置 \\
+$\delta_m^*(\mathbf{p}, \tau)$ & 导出量 & 最小安全退让距离 \\
+\hline
+$f_1 = C_{\max}$ & 目标函数 & 最大完成时间 \\
+$f_2 = D_{\text{total}}$ & 目标函数 & 总移动距离（含退让） \\
+$f_3 = N_{\text{retract}}$ & 目标函数 & 实际退让操作次数 \\
+$f_4 = T_{\text{blocked}}$ & 目标函数 & 总阻塞时间 \\
+\hline
+\end{tabular}
+\caption{数学符号汇总表}
+\end{table}
+
+\end{document}
